@@ -38,7 +38,7 @@ dependencies:
   camera: ^0.10.0+3
   custom_ratio_camera: ^0.0.4
   image_gallery_saver_plus: ^3.0.5
-  flutter_vision: ^1.1.4
+  pytorch_lite: ^4.2.5
 
 dev_dependencies:
   flutter_test:

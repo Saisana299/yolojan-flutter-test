@@ -4,11 +4,13 @@ import 'package:camera/camera.dart';
 import 'package:custom_ratio_camera/custom_ratio_camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_vision/flutter_vision.dart';
+import 'package:pytorch_lite/pytorch_lite.dart';
 import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
 import 'package:yolojan/theme.dart';
+import 'package:yolojan/utils/camera_view_singleton.dart';
 
 late List<CameraDescription> _cameras;
+int _camFrameRotation = 0;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -45,49 +47,73 @@ class CameraPage extends StatefulWidget {
 class CameraPageState extends State<CameraPage> {
   late CameraController controller;
   late Future<void> initializeControllerFuture;
-  late FlutterVision vision;
-  late List<Map<String, dynamic>> yoloResults;
+  late List<ResultObjectDetection> yoloResults;
+
+  late ModelObjectDetection _objectModel;
 
   CameraImage? cameraImage;
   bool isLoaded = false;
   bool isDetecting = false;
 
-  Duration throttleDuration = const Duration(milliseconds: 100);
-  DateTime? lastProcessedTime;
-
   @override
   void initState() {
     super.initState();
+    initStateAsync();
+  }
 
-    vision = FlutterVision();
+  void initStateAsync() async {
+    await loadYoloModel();
+    initializeCamera();
+    setState(() {
+      isLoaded = true;
+      isDetecting = false;
+      yoloResults = [];
+    });
+  }
+
+  Future loadYoloModel() async {
+    _objectModel = await PytorchLite.loadObjectDetectionModel(
+      "assets/yolov8n.torchscript", 80, 640, 640,
+      labelPath: "assets/labels.txt",
+      objectDetectionModelType: ObjectDetectionModelType.yolov8
+    );
+    setState(() {
+      isLoaded = true;
+    });
+  }
+
+  void initializeCamera() async {
+    var idx =
+        _cameras.indexWhere((c) => c.lensDirection == CameraLensDirection.back);
+    if (idx < 0) {
+      // log("No Back camera found - weird");
+      return;
+    }
+    var desc = _cameras[idx];
+    _camFrameRotation = Platform.isAndroid ? desc.sensorOrientation : 0;
 
     controller = CameraController(
-      _cameras[0],
-      ResolutionPreset.max,
+      desc,
+      ResolutionPreset.high,
+      imageFormatGroup: Platform.isAndroid
+        ? ImageFormatGroup.yuv420
+        : ImageFormatGroup.bgra8888,
       enableAudio: false,
     );
 
-    initializeControllerFuture = controller.initialize().then((value) {
-      loadYoloModel().then((value) {
-        setState(() {
-          isLoaded = true;
-          isDetecting = false;
-          yoloResults = [];
-        });
-      });
+    initializeControllerFuture = controller.initialize().then((_) async {
+      Size? previewSize = controller.value.previewSize;
+      CameraViewSingleton.inputImageSize = previewSize!;
+      if(mounted) {
+        Size screenSize = MediaQuery.of(context).size;
+        CameraViewSingleton.screenSize = screenSize;
+        CameraViewSingleton.ratio = controller.value.aspectRatio;
+      }
     });
   }
 
   @override
-  void dispose() async {
-    controller.dispose();
-    super.dispose();
-    await vision.closeYoloModel();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    final Size size = MediaQuery.of(context).size;
     if (!isLoaded) {
       return const Scaffold(
         body: Center(
@@ -112,7 +138,7 @@ class CameraPageState extends State<CameraPage> {
                         expectedRatio: 16/9,
                       ),
                     ),
-                    ...displayBoxesAroundRecognizedObjects(size),
+                    ...boxWidget(),
                   ],
                 );
               } else {
@@ -155,34 +181,22 @@ class CameraPageState extends State<CameraPage> {
     );
   }
 
-  Future<void> loadYoloModel() async {
-    await vision.loadYoloModel(
-      labels: 'assets/labels.txt',
-      modelPath: 'assets/yolov8n.tflite',
-      modelVersion: "yolov8",
-      numThreads: 8,
-      useGpu: true,
-      quantization: false,
-    );
-    setState(() {
-      isLoaded = true;
-    });
+  @override
+  void dispose() async {
+    controller.dispose();
+    super.dispose();
   }
 
   Future<void> yoloOnFrame(CameraImage cameraImage) async {
-    final result = await vision.yoloOnFrame(
-      bytesList: cameraImage.planes.map((plane) => plane.bytes).toList(),
-      imageHeight: cameraImage.height,
-      imageWidth: cameraImage.width,
-      iouThreshold: 0.4,
-      // confThreshold: 0.5,
-      classThreshold: 0.5,
+    List<ResultObjectDetection> objDetect = await _objectModel.getCameraImagePrediction(
+      cameraImage,
+      _camFrameRotation,
+      minimumScore: 0.1,
+      iOUThreshold: 0.3
     );
-    if(result.isNotEmpty) {
-      setState(() {
-        yoloResults = result;
-      });
-    }
+    setState(() {
+      yoloResults = objDetect;
+    });
   }
 
   Future<void> startDetection() async {
@@ -194,50 +208,59 @@ class CameraPageState extends State<CameraPage> {
     }
     await controller.startImageStream((image) async {
       if (isDetecting) {
-        // final currentTime = DateTime.now();
-        // if (
-        //   lastProcessedTime == null ||
-        //   currentTime.difference(lastProcessedTime!) > throttleDuration
-        // ) {
-        //   lastProcessedTime = currentTime;
-          cameraImage = image;
-          yoloOnFrame(image);
-        // }
+        cameraImage = image;
+        yoloOnFrame(image);
       }
     });
   }
 
   Future<void> stopDetection() async {
+    await controller.stopImageStream();
     setState(() {
       isDetecting = false;
       yoloResults.clear();
     });
   }
 
-  List<Widget> displayBoxesAroundRecognizedObjects(Size screen) {
+  List<Widget> boxWidget() {
     if (yoloResults.isEmpty) return [];
-    double factorX = screen.width / (cameraImage?.height ?? 1);
-    double factorY = screen.height / (cameraImage?.width ?? 1);
 
-    Color colorPick = const Color.fromARGB(255, 50, 233, 30);
+    Color? usedColor = Colors.red;//todo
+
+    Size screenSize = CameraViewSingleton.actualPreviewSizeH;
+    double factorX = screenSize.width;
+    double factorY = screenSize.height;
 
     return yoloResults.map((result) {
       return Positioned(
-        left: result["box"][0] * factorX,
-        top: result["box"][1] * factorY,
-        width: (result["box"][2] - result["box"][0]) * factorX,
-        height: (result["box"][3] - result["box"][1]) * factorY,
+        left: result.rect.left * factorX,
+        top: result.rect.top * factorY,
+        width: result.rect.width * factorX,
+        height: result.rect.height * factorY,
+
+        //left: re?.rect.left.toDouble(),
+        //top: re?.rect.top.toDouble(),
+        //right: re.rect.right.toDouble(),
+        //bottom: re.rect.bottom.toDouble(),
         child: Container(
+          width: result.rect.width * factorX,
+          height: result.rect.height * factorY,
           decoration: BoxDecoration(
-            borderRadius: const BorderRadius.all(Radius.circular(10.0)),
-            border: Border.all(color: Colors.pink, width: 2.0),
-          ),
-          child: Text(
-            "${result['tag']} ${(result['box'][4] * 100).toStringAsFixed(0)}%",
-            style: TextStyle(
-              background: Paint()..color = colorPick,
-              color: Colors.white,
-              fontSize: 18.0,
+              border: Border.all(color: usedColor!, width: 3),
+              borderRadius: const BorderRadius.all(Radius.circular(2))),
+          child: Align(
+            alignment: Alignment.topLeft,
+            child: FittedBox(
+              child: Container(
+                color: usedColor,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Text(result.className ?? result.classIndex.toString()),
+                    Text(" ${result.score.toStringAsFixed(2)}"),
+                  ],
+                ),
+              ),
             ),
           ),
         ),
